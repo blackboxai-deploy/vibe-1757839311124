@@ -1,0 +1,425 @@
+import TurndownService from 'turndown';
+import { tables, strikethrough, taskListItems } from 'turndown-plugin-gfm';
+
+export interface DocusaurusConfig {
+  title: string;
+  sidebarPosition: number;
+  description: string;
+  tags: string[];
+  keywords?: string[];
+  slug?: string;
+  sidebarLabel?: string;
+  addFrontmatter: boolean;
+  convertTabs: boolean;
+  convertAdmonitions: boolean;
+  convertCodeBlocks: boolean;
+  processImages?: boolean;
+  customFrontmatter?: string;
+}
+
+export interface ConversionResult {
+  markdown: string;
+  stats: {
+    htmlLines: number;
+    markdownLines: number;
+    elementsConverted: number;
+    linksFound: number;
+    imagesFound: number;
+    tablesFound: number;
+  };
+}
+
+class DocusaurusConverter {
+  private turndownService: TurndownService;
+  private stats: ConversionResult['stats'];
+
+  constructor(config: DocusaurusConfig) {
+    this.stats = {
+      htmlLines: 0,
+      markdownLines: 0,
+      elementsConverted: 0,
+      linksFound: 0,
+      imagesFound: 0,
+      tablesFound: 0,
+    };
+
+    this.turndownService = new TurndownService({
+      headingStyle: 'atx',
+      hr: '---',
+      bulletListMarker: '-',
+      codeBlockStyle: 'fenced',
+      fence: '```',
+      emDelimiter: '*',
+      strongDelimiter: '**',
+      linkStyle: 'inlined',
+      linkReferenceStyle: 'full',
+    });
+
+    // Add GitHub Flavored Markdown support
+    this.turndownService.use([tables, strikethrough, taskListItems]);
+
+    this.setupCustomRules(config);
+  }
+
+  private setupCustomRules(config: DocusaurusConfig) {
+    // Custom rule for Docusaurus admonitions
+    if (config.convertAdmonitions) {
+      this.turndownService.addRule('admonitions', {
+        filter: ['blockquote'],
+        replacement: (content, node) => {
+          const blockquote = node as HTMLElement;
+          const text = blockquote.textContent || '';
+          
+          // Detect different types of callouts
+          let admonitionType = 'note';
+          if (text.toLowerCase().includes('warning') || text.toLowerCase().includes('caution')) {
+            admonitionType = 'warning';
+          } else if (text.toLowerCase().includes('tip') || text.toLowerCase().includes('pro tip')) {
+            admonitionType = 'tip';
+          } else if (text.toLowerCase().includes('danger') || text.toLowerCase().includes('error')) {
+            admonitionType = 'danger';
+          } else if (text.toLowerCase().includes('info') || text.toLowerCase().includes('information')) {
+            admonitionType = 'info';
+          }
+
+          return `\n::${admonitionType}\n${content.trim()}\n::\n\n`;
+        }
+      });
+    }
+
+    // Enhanced code block handling
+    if (config.convertCodeBlocks) {
+      this.turndownService.addRule('codeBlocks', {
+        filter: ['pre'],
+        replacement: (content, node) => {
+          const pre = node as HTMLElement;
+          const code = pre.querySelector('code');
+          
+          if (code) {
+            let language = '';
+            
+            // Try to detect language from class names
+            const classNames = code.className || '';
+            const languageMatch = classNames.match(/language-(\w+)|lang-(\w+)|(\w+)-code/);
+            if (languageMatch) {
+              language = languageMatch[1] || languageMatch[2] || languageMatch[3];
+            }
+
+            // Clean up the code content
+            const codeContent = code.textContent || '';
+            return `\n\`\`\`${language}\n${codeContent}\n\`\`\`\n\n`;
+          }
+          
+          return `\n\`\`\`\n${content}\n\`\`\`\n\n`;
+        }
+      });
+    }
+
+    // Image processing
+    this.turndownService.addRule('images', {
+      filter: 'img',
+      replacement: (content, node) => {
+        const img = node as HTMLImageElement;
+        const src = img.getAttribute('src') || '';
+        const alt = img.getAttribute('alt') || '';
+        const title = img.getAttribute('title') || '';
+        
+        this.stats.imagesFound++;
+        
+        if (config.processImages) {
+          // Convert relative paths to work with Docusaurus
+          const processedSrc = src.startsWith('http') ? src : `./assets/${src}`;
+          return title ? `![${alt}](${processedSrc} "${title}")` : `![${alt}](${processedSrc})`;
+        }
+        
+        return title ? `![${alt}](${src} "${title}")` : `![${alt}](${src})`;
+      }
+    });
+
+    // Link processing with stats tracking
+    this.turndownService.addRule('links', {
+      filter: 'a',
+      replacement: (content, node) => {
+        const a = node as HTMLAnchorElement;
+        const href = a.getAttribute('href') || '';
+        const title = a.getAttribute('title') || '';
+        
+        this.stats.linksFound++;
+        
+        if (!href) return content;
+        
+        return title ? `[${content}](${href} "${title}")` : `[${content}](${href})`;
+      }
+    });
+
+    // Table processing with stats
+    this.turndownService.addRule('tables', {
+      filter: 'table',
+      replacement: (content) => {
+        this.stats.tablesFound++;
+        return content; // Let the default GFM table handling work
+      }
+    });
+
+    // Tab conversion for Docusaurus
+    if (config.convertTabs) {
+      this.turndownService.addRule('tabs', {
+        filter: (node) => {
+          const element = node as HTMLElement;
+          return element.tagName === 'DIV' && 
+                 (element.className.includes('tab') || 
+                  element.querySelector('.tab-content, .tab-pane, [role="tabpanel"]') !== null);
+        },
+        replacement: (content, node) => {
+          const tabContainer = node as HTMLElement;
+          const tabHeaders = tabContainer.querySelectorAll('[role="tab"], .tab-header, .nav-tab');
+          
+          if (tabHeaders.length > 0) {
+            let tabsMarkdown = '\n<Tabs>\n';
+            
+            tabHeaders.forEach((header, index) => {
+              const tabLabel = header.textContent?.trim() || `Tab ${index + 1}`;
+              const tabContent = this.extractTabContent(tabContainer, index);
+              
+              tabsMarkdown += `<TabItem value="tab${index}" label="${tabLabel}">\n\n${tabContent}\n\n</TabItem>\n`;
+            });
+            
+            tabsMarkdown += '</Tabs>\n\n';
+            return tabsMarkdown;
+          }
+          
+          return content;
+        }
+      });
+    }
+
+    // Count elements for stats - Fixed unused parameters
+    this.turndownService.addRule('elementCounter', {
+      filter: () => true,
+      replacement: (content, node) => {
+        if (node.nodeType === 1) { // Element node
+          this.stats.elementsConverted++;
+        }
+        return content;
+      }
+    });
+  }
+
+  private extractTabContent(container: HTMLElement, index: number): string {
+    const tabPanes = container.querySelectorAll('.tab-content, .tab-pane, [role="tabpanel"]');
+    if (tabPanes[index]) {
+      return this.turndownService.turndown(tabPanes[index].innerHTML);
+    }
+    return 'Tab content here...';
+  }
+
+  public convert(html: string): string {
+    // Reset stats
+    this.stats = {
+      htmlLines: html.split('\n').length,
+      markdownLines: 0,
+      elementsConverted: 0,
+      linksFound: 0,
+      imagesFound: 0,
+      tablesFound: 0,
+    };
+
+    // Clean HTML before conversion
+    const cleanedHtml = this.cleanHtml(html);
+    
+    // Convert to markdown
+    let markdown = this.turndownService.turndown(cleanedHtml);
+    
+    // Post-process markdown
+    markdown = this.postProcessMarkdown(markdown);
+    
+    // Update stats
+    this.stats.markdownLines = markdown.split('\n').length;
+    
+    return markdown;
+  }
+
+  private cleanHtml(html: string): string {
+    // Remove script tags
+    html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+    
+    // Remove style tags
+    html = html.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '');
+    
+    // Remove navigation elements
+    html = html.replace(/<nav\b[^>]*>[\s\S]*?<\/nav>/gi, '');
+    
+    // Remove footer elements
+    html = html.replace(/<footer\b[^>]*>[\s\S]*?<\/footer>/gi, '');
+    
+    // Remove common non-content elements
+    html = html.replace(/<div[^>]*class="[^"]*(?:sidebar|navigation|menu|breadcrumb)[^"]*"[^>]*>[\s\S]*?<\/div>/gi, '');
+    
+    // Clean up extra whitespace
+    html = html.replace(/\s+/g, ' ').trim();
+    
+    return html;
+  }
+
+  private postProcessMarkdown(markdown: string): string {
+    // Fix multiple consecutive line breaks
+    markdown = markdown.replace(/\n{3,}/g, '\n\n');
+    
+    // Ensure proper spacing around headers
+    markdown = markdown.replace(/([^\n])\n(#{1,6} )/g, '$1\n\n$2');
+    markdown = markdown.replace(/(#{1,6} [^\n]+)\n([^\n])/g, '$1\n\n$2');
+    
+    // Clean up list formatting
+    markdown = markdown.replace(/([^\n])\n([-*+] )/g, '$1\n\n$2');
+    markdown = markdown.replace(/([^\n])\n(\d+\. )/g, '$1\n\n$2');
+    
+    // Fix code block spacing
+    markdown = markdown.replace(/([^\n])\n(```)/g, '$1\n\n$2');
+    markdown = markdown.replace(/(```[^\n]*\n[\s\S]*?\n```)\n([^\n])/g, '$1\n\n$2');
+    
+    return markdown.trim();
+  }
+
+  public getStats(): ConversionResult['stats'] {
+    return { ...this.stats };
+  }
+}
+
+export async function convertHtmlToMarkdown(
+  html: string, 
+  config: DocusaurusConfig
+): Promise<ConversionResult> {
+  const converter = new DocusaurusConverter(config);
+  const markdown = converter.convert(html);
+  const stats = converter.getStats();
+
+  // Generate frontmatter if enabled
+  let finalMarkdown = markdown;
+  if (config.addFrontmatter) {
+    const frontmatter = generateFrontmatter(config);
+    finalMarkdown = frontmatter + markdown;
+  }
+
+  return {
+    markdown: finalMarkdown,
+    stats
+  };
+}
+
+function generateFrontmatter(config: DocusaurusConfig): string {
+  const frontmatterObj: Record<string, any> = {};
+  
+  if (config.title) frontmatterObj.title = config.title;
+  if (config.description) frontmatterObj.description = config.description;
+  if (config.sidebarPosition) frontmatterObj.sidebar_position = config.sidebarPosition;
+  if (config.sidebarLabel) frontmatterObj.sidebar_label = config.sidebarLabel;
+  if (config.slug) frontmatterObj.slug = config.slug;
+  if (config.tags && config.tags.length > 0) frontmatterObj.tags = config.tags;
+  if (config.keywords && config.keywords.length > 0) frontmatterObj.keywords = config.keywords;
+
+  // Parse custom frontmatter
+  if (config.customFrontmatter) {
+    try {
+      const customLines = config.customFrontmatter.split('\n').filter(line => line.trim());
+      for (const line of customLines) {
+        const colonIndex = line.indexOf(':');
+        if (colonIndex > 0) {
+          const key = line.substring(0, colonIndex).trim();
+          let value = line.substring(colonIndex + 1).trim();
+          
+          // Remove quotes if present
+          if ((value.startsWith('"') && value.endsWith('"')) || 
+              (value.startsWith("'") && value.endsWith("'"))) {
+            value = value.slice(1, -1);
+          }
+          
+          frontmatterObj[key] = value;
+        }
+      }
+    } catch (error) {
+      console.error('Error parsing custom frontmatter:', error);
+    }
+  }
+
+  if (Object.keys(frontmatterObj).length === 0) {
+    return '';
+  }
+
+  const yamlLines = Object.entries(frontmatterObj).map(([key, value]) => {
+    if (Array.isArray(value)) {
+      return `${key}:\n${value.map(v => `  - ${v}`).join('\n')}`;
+    }
+    return `${key}: ${typeof value === 'string' ? `"${value}"` : value}`;
+  });
+
+  return `---\n${yamlLines.join('\n')}\n---\n\n`;
+}
+
+// Browser-compatible version that doesn't require Node.js modules
+export function convertHtmlToMarkdownBrowser(html: string, config: DocusaurusConfig): ConversionResult {
+  // Simplified conversion for browser environment
+  // This is a fallback when full Turndown isn't available
+  
+  const stats = {
+    htmlLines: html.split('\n').length,
+    markdownLines: 0,
+    elementsConverted: 0,
+    linksFound: (html.match(/<a\s+[^>]*href/gi) || []).length,
+    imagesFound: (html.match(/<img\s+[^>]*src/gi) || []).length,
+    tablesFound: (html.match(/<table/gi) || []).length,
+  };
+
+  // Basic HTML to Markdown conversion
+  let markdown = html
+    // Headers
+    .replace(/<h1[^>]*>(.*?)<\/h1>/gi, '# $1\n\n')
+    .replace(/<h2[^>]*>(.*?)<\/h2>/gi, '## $1\n\n')
+    .replace(/<h3[^>]*>(.*?)<\/h3>/gi, '### $1\n\n')
+    .replace(/<h4[^>]*>(.*?)<\/h4>/gi, '#### $1\n\n')
+    .replace(/<h5[^>]*>(.*?)<\/h5>/gi, '##### $1\n\n')
+    .replace(/<h6[^>]*>(.*?)<\/h6>/gi, '###### $1\n\n')
+    
+    // Bold and italic
+    .replace(/<(strong|b)[^>]*>(.*?)<\/(strong|b)>/gi, '**$2**')
+    .replace(/<(em|i)[^>]*>(.*?)<\/(em|i)>/gi, '*$2*')
+    
+    // Links
+    .replace(/<a\s+[^>]*href="([^"]*)"[^>]*>(.*?)<\/a>/gi, '[$2]($1)')
+    
+    // Images
+    .replace(/<img\s+[^>]*src="([^"]*)"[^>]*alt="([^"]*)"[^>]*\/?>/gi, '![$2]($1)')
+    .replace(/<img\s+[^>]*src="([^"]*)"[^>]*\/?>/gi, '![]($1)')
+    
+    // Code
+    .replace(/<code[^>]*>(.*?)<\/code>/gi, '`$1`')
+    .replace(/<pre[^>]*><code[^>]*>(.*?)<\/code><\/pre>/gi, '```\n$1\n```\n')
+    
+    // Lists
+    .replace(/<ul[^>]*>/gi, '')
+    .replace(/<\/ul>/gi, '\n')
+    .replace(/<li[^>]*>(.*?)<\/li>/gi, '- $1\n')
+    
+    // Paragraphs
+    .replace(/<p[^>]*>(.*?)<\/p>/gi, '$1\n\n')
+    
+    // Line breaks
+    .replace(/<br\s*\/?>/gi, '\n')
+    
+    // Remove remaining HTML tags
+    .replace(/<[^>]+>/g, '')
+    
+    // Clean up whitespace
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  stats.markdownLines = markdown.split('\n').length;
+  stats.elementsConverted = (html.match(/<[^>]+>/g) || []).length;
+
+  // Add frontmatter if enabled
+  if (config.addFrontmatter) {
+    const frontmatter = generateFrontmatter(config);
+    markdown = frontmatter + markdown;
+  }
+
+  return { markdown, stats };
+}
